@@ -1,8 +1,8 @@
-// Copyright 2022 rateLimit Author(https://github.com/yudeguang/noGcStaticMap). All Rights Reserved.
+// Copyright 2022 rateLimit Author(https://github.com/yudeguang17/noGcStaticMap). All Rights Reserved.
 //
 // This Source Code Form is subject to the terms of the MIT License.
 // If a copy of the MIT was not distributed with this file,
-// You can obtain one at https://github.com/yudeguang/noGcStaticMap.
+// You can obtain one at https://github.com/yudeguang17/noGcStaticMap.
 package noGcStaticMap
 
 import (
@@ -23,7 +23,7 @@ type NoGcStaticMapInt struct {
 	index        [512]map[int]uint32 //值为切片data []byte中的某个位置
 }
 
-//初始化 键的类型为int,值的最大长度为65535，与默认类型相比，速度稍快，稍微节省存储空间
+// 初始化 键的类型为int,值的最大长度为65535，与默认类型相比，速度稍快，稍微节省存储空间
 func NewInt(tempFileName ...string) *NoGcStaticMapInt {
 	var n NoGcStaticMapInt
 	for i := range n.index {
@@ -33,7 +33,7 @@ func NewInt(tempFileName ...string) *NoGcStaticMapInt {
 	return &n
 }
 
-//取出数据
+// 取出数据
 func (n *NoGcStaticMapInt) Get(k int) (v []byte, exist bool) {
 	if !n.setFinished {
 		panic("cant't Get before SetFinished")
@@ -47,7 +47,7 @@ func (n *NoGcStaticMapInt) Get(k int) (v []byte, exist bool) {
 	return v, false
 }
 
-//取出数据 警告:返回的数据是hash表中值的引用，而非值的复制品，要注意不要在外部改变该返回值s
+// 取出数据 警告:返回的数据是hash表中值的引用，而非值的复制品，要注意不要在外部改变该返回值s
 func (n *NoGcStaticMapInt) GetUnsafe(k int) (v []byte, exist bool) {
 	dataBeginPos, exist := n.GetDataBeginPosOfKVPair(k)
 	if !exist {
@@ -56,7 +56,7 @@ func (n *NoGcStaticMapInt) GetUnsafe(k int) (v []byte, exist bool) {
 	return n.GetValFromDataBeginPosOfKVPairUnSafe(int(dataBeginPos)), true
 }
 
-//取出数据,以string的方式
+// 取出数据,以string的方式
 func (n *NoGcStaticMapInt) GetString(k int) (v string, exist bool) {
 	vbyte, exist := n.Get(k)
 	if exist {
@@ -65,7 +65,17 @@ func (n *NoGcStaticMapInt) GetString(k int) (v string, exist bool) {
 	return v, false
 }
 
-//取出键值对在数据中存储的开始位置
+// 取出数据 警告:返回的数据是hash表中值的引用，而非值的复制品，要注意不要在外部改变该返回值
+// 只要不使用UnsafeStringToBytes函数把它变化成[]byte,并用下标的方式修改值就行,所以这个函数基本是安全的
+func (n *NoGcStaticMapInt) GetStringUnsafe(k int) (v string, exist bool) {
+	dataBeginPos, exist := n.GetDataBeginPosOfKVPair(k)
+	if !exist {
+		return "", false
+	}
+	return UnsafeBytesToString(n.GetValFromDataBeginPosOfKVPairUnSafe(int(dataBeginPos))), true
+}
+
+// 取出键值对在数据中存储的开始位置
 func (n *NoGcStaticMapInt) GetDataBeginPosOfKVPair(k int) (uint32, bool) {
 	if !n.setFinished {
 		panic("cant't Get before SetFinished")
@@ -76,10 +86,10 @@ func (n *NoGcStaticMapInt) GetDataBeginPosOfKVPair(k int) (uint32, bool) {
 	return dataBeginPos, exist
 }
 
-//从内存中的某个位置取出键值对中值的数据
-//警告:
-//1)传入的dataBeginPos必须是真实有效的，否则有可能会数据越界;
-//2)返回的数据是hash表中值的引用，而非值的复制品，要注意不要在外部改变该返回值
+// 从内存中的某个位置取出键值对中值的数据
+// 警告:
+// 1)传入的dataBeginPos必须是真实有效的，否则有可能会数据越界;
+// 2)返回的数据是hash表中值的引用，而非值的复制品，要注意不要在外部改变该返回值
 func (n *NoGcStaticMapInt) GetValFromDataBeginPosOfKVPairUnSafe(dataBeginPos int) (v []byte) {
 	//读取键值的长度
 	kvLenBuf := n.data[dataBeginPos : dataBeginPos+2]
@@ -93,7 +103,7 @@ func (n *NoGcStaticMapInt) GetValFromDataBeginPosOfKVPairUnSafe(dataBeginPos int
 	return n.data[dataBeginPos : dataBeginPos+int(valLen)]
 }
 
-//增加数据
+// 增加数据
 func (n *NoGcStaticMapInt) Set(k int, v []byte) {
 	n.len = n.len + 1
 	//键值设置完之后，不允许再添加
@@ -116,12 +126,12 @@ func (n *NoGcStaticMapInt) Set(k int, v []byte) {
 	n.write(v)
 }
 
-//增加数据,以string的方式
+// 增加数据,以string的方式
 func (n *NoGcStaticMapInt) SetString(k int, v string) {
 	n.Set(k, []byte(v))
 }
 
-//从内存中读取相应数据
+// 从内存中读取相应数据
 func (n *NoGcStaticMapInt) read(dataBeginPos int) (v []byte) {
 	//读取键值的长度
 	kvLenBuf := n.data[dataBeginPos : dataBeginPos+2]
@@ -137,7 +147,7 @@ func (n *NoGcStaticMapInt) read(dataBeginPos int) (v []byte) {
 	return v
 }
 
-//往文件中写入数据
+// 往文件中写入数据
 func (n *NoGcStaticMapInt) write(v []byte) {
 	dataLen := 2 + len(v) //2个字节表示V的长度
 	//直接从fastcache复制过来
@@ -156,7 +166,7 @@ func (n *NoGcStaticMapInt) write(v []byte) {
 	n.dataBeginPos = n.dataBeginPos + dataLen
 }
 
-//完成存储把存储到硬盘上的文件复制到内存
+// 完成存储把存储到硬盘上的文件复制到内存
 func (n *NoGcStaticMapInt) SetFinished() {
 	n.setFinished = true
 	err := n.bw.Flush()
@@ -173,7 +183,7 @@ func (n *NoGcStaticMapInt) SetFinished() {
 	haserrPanic(err)
 }
 
-//返回键值对个数
+// 返回键值对个数
 func (n *NoGcStaticMapInt) Len() int {
 	return n.len
 }

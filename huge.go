@@ -1,8 +1,8 @@
-// Copyright 2022 rateLimit Author(https://github.com/yudeguang/noGcStaticMap). All Rights Reserved.
+// Copyright 2022 rateLimit Author(https://github.com/yudeguang17/noGcStaticMap). All Rights Reserved.
 //
 // This Source Code Form is subject to the terms of the MIT License.
 // If a copy of the MIT was not distributed with this file,
-// You can obtain one at https://github.com/yudeguang/noGcStaticMap.
+// You can obtain one at https://github.com/yudeguang17/noGcStaticMap.
 package noGcStaticMap
 
 import (
@@ -14,7 +14,7 @@ import (
 	"os"
 )
 
-//其它类型，值最长为65535，此类型无此限制
+// 其它类型，值最长为65535，此类型无此限制
 type NoGcStaticMapHuge struct {
 	setFinished         bool //是否完成存储
 	dataBeginPos        int  //游标，记录位置
@@ -27,7 +27,7 @@ type NoGcStaticMapHuge struct {
 	mapForHashCollision map[string]uint32      //值为切片data []byte中的某个位置,string为存放有hash冲突的第2次或2次以上出现的key,这个map一般来说是非常小的
 }
 
-//初始化 对键值的长度不做限制，除非是存储值的长度超长的情况，否则不建议使用此类型，因为会占用更多的空间
+// 初始化 对键值的长度不做限制，除非是存储值的长度超长的情况，否则不建议使用此类型，因为会占用更多的空间
 func NewHuge(tempFileName ...string) *NoGcStaticMapHuge {
 	var n NoGcStaticMapHuge
 	n.mapForHashCollision = make(map[string]uint32)
@@ -38,7 +38,7 @@ func NewHuge(tempFileName ...string) *NoGcStaticMapHuge {
 	return &n
 }
 
-//取出数据
+// 取出数据
 func (n *NoGcStaticMapHuge) Get(k []byte) (v []byte, exist bool) {
 	if !n.setFinished {
 		panic("cant't Get before SetFinished")
@@ -60,7 +60,7 @@ func (n *NoGcStaticMapHuge) Get(k []byte) (v []byte, exist bool) {
 	return v, false
 }
 
-//取出数据 警告:返回的数据是hash表中值的引用，而非值的复制品，要注意不要在外部改变该返回值
+// 取出数据 警告:返回的数据是hash表中值的引用，而非值的复制品，要注意不要在外部改变该返回值
 func (n *NoGcStaticMapHuge) GetUnsafe(k []byte) (v []byte, exist bool) {
 	dataBeginPos, exist := n.GetDataBeginPosOfKVPair(k)
 	if !exist {
@@ -69,7 +69,7 @@ func (n *NoGcStaticMapHuge) GetUnsafe(k []byte) (v []byte, exist bool) {
 	return n.GetValFromDataBeginPosOfKVPairUnSafe(int(dataBeginPos)), true
 }
 
-//取出数据,以string的方式
+// 取出数据,以string的方式
 func (n *NoGcStaticMapHuge) GetString(k string) (v string, exist bool) {
 	vbyte, exist := n.Get([]byte(k))
 	if exist {
@@ -78,7 +78,17 @@ func (n *NoGcStaticMapHuge) GetString(k string) (v string, exist bool) {
 	return v, false
 }
 
-//取出键值对在数据中存储的开始位置
+// 取出数据 警告:返回的数据是hash表中值的引用，而非值的复制品，要注意不要在外部改变该返回值
+// 只要不使用UnsafeStringToBytes函数把它变化成[]byte,并用下标的方式修改值就行,所以这个函数基本是安全的
+func (n *NoGcStaticMapHuge) GetStringUnsafe(k string) (v string, exist bool) {
+	dataBeginPos, exist := n.GetDataBeginPosOfKVPair([]byte(k))
+	if !exist {
+		return "", false
+	}
+	return UnsafeBytesToString(n.GetValFromDataBeginPosOfKVPairUnSafe(int(dataBeginPos))), true
+}
+
+// 取出键值对在数据中存储的开始位置
 func (n *NoGcStaticMapHuge) GetDataBeginPosOfKVPair(k []byte) (uint32, bool) {
 	if !n.setFinished {
 		panic("cant't Get before SetFinished")
@@ -103,10 +113,10 @@ func (n *NoGcStaticMapHuge) GetDataBeginPosOfKVPair(k []byte) (uint32, bool) {
 	return 0, false
 }
 
-//从内存中的某个位置取出键值对中值的数据
-//警告:
-//1)传入的dataBeginPos必须是真实有效的，否则有可能会数据越界;
-//2)返回的数据是hash表中值的引用，而非值的复制品，要注意不要在外部改变该返回值
+// 从内存中的某个位置取出键值对中值的数据
+// 警告:
+// 1)传入的dataBeginPos必须是真实有效的，否则有可能会数据越界;
+// 2)返回的数据是hash表中值的引用，而非值的复制品，要注意不要在外部改变该返回值
 func (n *NoGcStaticMapHuge) GetValFromDataBeginPosOfKVPairUnSafe(dataBeginPos int) (v []byte) {
 	keyLen := binary.LittleEndian.Uint32(n.data[dataBeginPos : dataBeginPos+4])
 	dataBeginPos = dataBeginPos + 4
@@ -117,7 +127,7 @@ func (n *NoGcStaticMapHuge) GetValFromDataBeginPosOfKVPairUnSafe(dataBeginPos in
 	return n.data[dataBeginPos : dataBeginPos+int(valLen)]
 }
 
-//增加数据
+// 增加数据
 func (n *NoGcStaticMapHuge) Set(k, v []byte) {
 	n.len = n.len + 1
 	//键值设置完之后，不允许再添加
@@ -141,12 +151,12 @@ func (n *NoGcStaticMapHuge) Set(k, v []byte) {
 	n.write(k, v)
 }
 
-//增加数据,以string的方式
+// 增加数据,以string的方式
 func (n *NoGcStaticMapHuge) SetString(k, v string) {
 	n.Set([]byte(k), []byte(v))
 }
 
-//从内存中读取相应数据 注意 K,V长度各自占4个字节
+// 从内存中读取相应数据 注意 K,V长度各自占4个字节
 func (n *NoGcStaticMapHuge) read(k []byte, dataBeginPos int) (v []byte, exist bool) {
 	//读取键值的长度
 	keyLen := binary.LittleEndian.Uint32(n.data[dataBeginPos : dataBeginPos+4])
@@ -167,7 +177,7 @@ func (n *NoGcStaticMapHuge) read(k []byte, dataBeginPos int) (v []byte, exist bo
 	return v, true
 }
 
-//往文件中写入数据 注意 K,V长度各自占4个字节
+// 往文件中写入数据 注意 K,V长度各自占4个字节
 func (n *NoGcStaticMapHuge) write(k, v []byte) {
 	dataLen := 8 + len(k) + len(v) //K,V各自占4个字节
 	kbuf := uint32ToByte(uint32(len(k)))
@@ -192,7 +202,7 @@ func (n *NoGcStaticMapHuge) write(k, v []byte) {
 	n.dataBeginPos = n.dataBeginPos + dataLen
 }
 
-//完成存储把存储到硬盘上的文件复制到内存
+// 完成存储把存储到硬盘上的文件复制到内存
 func (n *NoGcStaticMapHuge) SetFinished() {
 	n.setFinished = true
 	err := n.bw.Flush()
@@ -209,7 +219,7 @@ func (n *NoGcStaticMapHuge) SetFinished() {
 	haserrPanic(err)
 }
 
-//返回键值对个数
+// 返回键值对个数
 func (n *NoGcStaticMapHuge) Len() int {
 	return n.len
 }

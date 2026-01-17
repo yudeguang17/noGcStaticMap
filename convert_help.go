@@ -1,19 +1,20 @@
-// Copyright 2022 rateLimit Author(https://github.com/yudeguang/noGcStaticMap). All Rights Reserved.
+// Copyright 2022 rateLimit Author(https://github.com/yudeguang17/noGcStaticMap). All Rights Reserved.
 //
 // This Source Code Form is subject to the terms of the MIT License.
 // If a copy of the MIT was not distributed with this file,
-// You can obtain one at https://github.com/yudeguang/noGcStaticMap.
+// You can obtain one at https://github.com/yudeguang17/noGcStaticMap.
 
 package noGcStaticMap
 
 import (
 	"fmt"
-	"github.com/yudeguang/iox"
+	"github.com/yudeguang17/iox"
 	"io"
 	"log"
 	"strconv"
 	"strings"
 	"sync"
+	"unsafe"
 )
 
 // 结构体案例
@@ -96,9 +97,7 @@ func BytesToStruct(data []byte) (p NoGcStructExample) {
 		if data[dataBeginPos+i] == SplitSep[0] || i == dataLen-1 {
 			if i == dataLen-1 {
 				byteBuf[byteBufDataLen] = data[dataBeginPos+i]
-				if byteBuf[0] != SplitSep[0] { //说明最后一条为空
-				    byteBufDataLen = byteBufDataLen + 1
-				}
+				byteBufDataLen = byteBufDataLen + 1
 			}
 			curField := string(byteBuf[0:byteBufDataLen])
 			//读取到SplitSep就换一个值，并且根据结构体的实际情况转换为对应的类型
@@ -208,4 +207,14 @@ func checkStr(s string) string {
 		panic(s + "can't contains " + string(SplitSep) + " Please modify the SplitSep")
 	}
 	return s
+}
+
+// BytesToString 将 []byte 零拷贝转换为 string
+// 前提：b 在整个 string 生命周期内不能被修改，且不能被释放
+func UnsafeBytesToString(b []byte) string {
+	return unsafe.String(unsafe.SliceData(b), len(b))
+}
+
+func UnsafeStringToBytes(s string) []byte {
+	return unsafe.Slice(unsafe.StringData(s), len(s))
 }
