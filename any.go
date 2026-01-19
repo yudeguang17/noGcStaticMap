@@ -19,20 +19,18 @@ type NoGcStaticMapAny struct {
 	dataBeginPos        int  //游标，记录位置
 	len                 int  //记录键值对个数
 	bw                  *bufio.Writer
-	tempFile            *os.File               //硬盘上的临时文件
-	tempFileName        string                 //临时文件名
-	data                []byte                 //存储键值的内容
-	index               [512]map[uint64]uint32 //值为切片data []byte中的某个位置,此索引存储无hash冲突的key的hash值以及有hashgo冲突但是是第1次出现的key的hash值
-	mapForHashCollision map[string]uint32      //值为切片data []byte中的某个位置,string为存放有hash冲突的第2次或2次以上出现的key,这个map一般来说是非常小的
+	tempFile            *os.File          //硬盘上的临时文件
+	tempFileName        string            //临时文件名
+	data                []byte            //存储键值的内容
+	index               map[uint64]uint32 //值为切片data []byte中的某个位置,此索引存储无hash冲突的key的hash值以及有hashgo冲突但是是第1次出现的key的hash值
+	mapForHashCollision map[string]uint32 //值为切片data []byte中的某个位置,string为存放有hash冲突的第2次或2次以上出现的key,这个map一般来说是非常小的
 }
 
 // 初始化 默认类型,键值的最大长度为65535
 func NewDefault(tempFileName ...string) *NoGcStaticMapAny {
 	var n NoGcStaticMapAny
 	n.mapForHashCollision = make(map[string]uint32)
-	for i := range n.index {
-		n.index[i] = make(map[uint64]uint32)
-	}
+	n.index = make(map[uint64]uint32)
 	n.tempFileName, n.tempFile, n.bw = createTempFile(tempFileName...)
 	return &n
 }
@@ -43,8 +41,7 @@ func (n *NoGcStaticMapAny) Get(k []byte) (v []byte, exist bool) {
 		panic("cant't Get before SetFinished")
 	}
 	h := xxhash.Sum64(k)
-	idx := h % 512
-	dataBeginPos, exist := n.index[idx][h]
+	dataBeginPos, exist := n.index[h]
 	if exist {
 		v, exist = n.read(k, int(dataBeginPos))
 		if exist {
@@ -93,8 +90,7 @@ func (n *NoGcStaticMapAny) GetDataBeginPosOfKVPair(k []byte) (uint32, bool) {
 		panic("cant't Get before SetFinished")
 	}
 	h := xxhash.Sum64(k)
-	idx := h % 512
-	dataBeginPos, exist := n.index[idx][h]
+	dataBeginPos, exist := n.index[h]
 	if exist {
 		_, exist = n.read(k, int(dataBeginPos))
 		if exist {
@@ -134,13 +130,13 @@ func (n *NoGcStaticMapAny) Set(k, v []byte) {
 		panic("can't Set after SetFinished")
 	}
 	h := xxhash.Sum64(k)
-	idx := h % 512
+
 	//判断键值的长度，不允许太长
 	if len(k) > 65535 || len(v) > 65535 {
 		panic("k or v is too long,The maximum is 65535")
 	}
 	//处理hash碰撞问题
-	_, exist := n.index[idx][h]
+	_, exist := n.index[h]
 	if exist {
 		//尽可能的避免重复加载,如果在mapNoHashCollision加载过，确实也是无法检测的，但是如果加载了3次一定会被检测到
 		if _, exist := n.mapForHashCollision[string(k)]; exist {
@@ -148,7 +144,7 @@ func (n *NoGcStaticMapAny) Set(k, v []byte) {
 		}
 		n.mapForHashCollision[string(k)] = uint32(n.dataBeginPos)
 	} else {
-		n.index[idx][h] = uint32(n.dataBeginPos)
+		n.index[h] = uint32(n.dataBeginPos)
 	}
 	//存储数据到临时文件，并且移动游标
 	n.write(k, v)

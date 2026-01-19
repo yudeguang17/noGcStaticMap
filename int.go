@@ -17,18 +17,16 @@ type NoGcStaticMapInt struct {
 	dataBeginPos int  //游标，记录位置
 	len          int  //记录键值对个数
 	bw           *bufio.Writer
-	tempFile     *os.File            //硬盘上的临时文件
-	tempFileName string              //临时文件名
-	data         []byte              //存储值的内容
-	index        [512]map[int]uint32 //值为切片data []byte中的某个位置
+	tempFile     *os.File       //硬盘上的临时文件
+	tempFileName string         //临时文件名
+	data         []byte         //存储值的内容
+	index        map[int]uint32 //值为切片data []byte中的某个位置
 }
 
 // 初始化 键的类型为int,值的最大长度为65535，与默认类型相比，速度稍快，稍微节省存储空间
 func NewInt(tempFileName ...string) *NoGcStaticMapInt {
 	var n NoGcStaticMapInt
-	for i := range n.index {
-		n.index[i] = make(map[int]uint32)
-	}
+	n.index = make(map[int]uint32)
 	n.tempFileName, n.tempFile, n.bw = createTempFile(tempFileName...)
 	return &n
 }
@@ -38,9 +36,7 @@ func (n *NoGcStaticMapInt) Get(k int) (v []byte, exist bool) {
 	if !n.setFinished {
 		panic("cant't Get before SetFinished")
 	}
-	idx := k % 512
-	dataBeginPos, exist := n.index[idx][k]
-
+	dataBeginPos, exist := n.index[k]
 	if exist {
 		return n.read(int(dataBeginPos)), true
 	}
@@ -80,9 +76,8 @@ func (n *NoGcStaticMapInt) GetDataBeginPosOfKVPair(k int) (uint32, bool) {
 	if !n.setFinished {
 		panic("cant't Get before SetFinished")
 	}
-	idx := k % 512
 	//这里无需校检键是否正确，故直接返回
-	dataBeginPos, exist := n.index[idx][k]
+	dataBeginPos, exist := n.index[k]
 	return dataBeginPos, exist
 }
 
@@ -110,17 +105,16 @@ func (n *NoGcStaticMapInt) Set(k int, v []byte) {
 	if n.setFinished {
 		panic("can't Set after SetFinished")
 	}
-	idx := k % 512
 	//判断键值的长度，不允许太长
 	if len(v) > 65535 {
 		panic("k or v is too long,The maximum is 65535")
 	}
 
-	_, exist := n.index[idx][k]
+	_, exist := n.index[k]
 	if exist {
 		panic("can't add the key '" + strconv.Itoa(k) + "' for twice")
 	} else {
-		n.index[idx][k] = uint32(n.dataBeginPos)
+		n.index[k] = uint32(n.dataBeginPos)
 	}
 	//存储数据到临时文件，并且移动游标
 	n.write(v)
