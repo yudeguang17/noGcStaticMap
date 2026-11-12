@@ -22,7 +22,7 @@ v, exist := m.GetString("key")
 | `Len()` | 校验前自增，panic 后计数虚高 | 写入成功后才自增 |
 | `SetFinished` | 不可重复调用；失败后留下"已完成"的假状态 | 幂等；失败不改变状态 |
 | 位置索引 | 直接 `uint32` 转换，超 4GiB 静默截断 | 转换前校验并明确报错 |
-| 临时文件 | 相对当前目录、会删除同名文件、名字取自纳秒时间戳 | 系统临时目录 + `O_EXCL` 独占创建，绝不删他人文件 |
+| 临时文件 | 相对当前目录、会删除同名文件、名字取自纳秒时间戳 | 系统临时目录 + `O_EXCL` 独占创建，同名时追加纳秒时间戳自动避让，绝不删他人文件 |
 | 加载内存 | `ReadFile` 后再复制一份，峰值双倍 | 直接接管读出的切片 |
 | 末尾分隔符 | 被算进最后一个字段（`"1\`a\`b\`c\`"` 的 `Col4` 变成 `"c\`"`） | 正确收尾，不污染字段 |
 
@@ -77,7 +77,21 @@ str, ok := m.GetValue(1001)   // -> "alice", true
 unsafeStr, ok := m.GetValueUnsafe(1001) //零拷贝，引用内存数据
 ```
 
-写入有两入口：`Set(id, str string)` 与 `SetBytes(id, []byte)`。两者收敛到同一个吃 `[]byte` 的内部实现，构建期用字节切片灌数据时不会额外复制一份字符串，也没有任何字符串常驻内存。
+写入有三个入口：`Set(id, str string)`、`SetBytes(id, []byte)` 与 `SetSafe(id, str) error`。前两个失败时 panic，`SetSafe` 则把失败原因作为 error 返回，适合"读一批数据、跳过重复项继续处理"不能中断的场景：
+
+```go
+err := m.SetSafe(1001, "alice")
+switch {
+case err == nil:
+case errors.Is(err, noGcStaticMap.ErrDuplicateID):   //id 已存在
+case errors.Is(err, noGcStaticMap.ErrDuplicateStr):  //字符串已存在
+case errors.Is(err, noGcStaticMap.ErrStrTooLong):    //超过 65535
+case errors.Is(err, noGcStaticMap.ErrSetFinished):   //SetFinished 之后写入
+case errors.Is(err, noGcStaticMap.ErrDataTooLarge):  //数据区超过 4GiB 上限
+}
+```
+
+`SetSafe` 与 `Set`/`SetBytes` 写入同一份数据与索引，混用时互相能识别重复；失败时数据区、索引与 `Len` 均保持原样，之后仍可继续写入。三个入口都收敛到同一个吃 `[]byte` 的内部实现，构建期用字节切片灌数据时不会额外复制一份字符串，也没有任何字符串常驻内存。
 
 重复字符串时 panic 消息只带前 64 字节并标注总长度（截断点落在 rune 边界上），避免几十 KB 的消息把整段业务数据写进日志或崩溃上报。
 
@@ -97,7 +111,8 @@ unsafeStr, ok := m.GetValueUnsafe(1001) //零拷贝，引用内存数据
 - **写入阶段**：单 goroutine 调用 `Set`，`Set` 不是并发安全的（并发写会触发 `fatal error: concurrent map writes`）。
 - **查询阶段**：`SetFinished` 之后可以多 goroutine 并发只读，测试覆盖 8 协程并发取值。
 - **数据区上限**：位置索引是 `uint32`，单个 map 的数据区上限为 4GiB-1 字节，超出会在写入时明确 panic（原实现会静默截断导致查询错乱）。
-- **临时文件**：不指定文件名时创建在系统临时目录；指定文件名时使用独占创建，同名文件已存在会明确报错而不会删除它。`SetFinished` 会关闭并删除临时文件；未调用就被丢弃时由 GC 终结器兜底清理。
+- **临时文件**：不指定文件名时创建在系统临时目录；指定文件名时使用独占创建，**同名文件已存在不会报错，也不会删改对方**，而是在基础名后追加"-"+纳秒时间戳换一个名字，例如 `NewBidirect("no_gc_map_bi")` 在冲突时实际使用 `no_gc_map_bi-1762912345123456789.NoGcStaticMap`。因此上次异常退出遗留的同名文件、或另一个实例正在使用的同名文件，都不会让程序启动即 panic。
+- **遗留文件**：本包只清理自己在 `SetFinished` 后创建的那个临时文件（未调用 `SetFinished` 就丢弃时由 GC 终结器兜底），不会主动清理磁盘上其它同名/陈旧文件；如果进程被强杀，可能留下 `*.NoGcStaticMap` 残留文件，需要由调用方按需清理。
 - **写入中途失败不可恢复**：`Set` 内部按"写失败即 panic"处理，`bufio.Writer` 或磁盘写入出错时直接 panic。这种情况下临时文件里可能残留半条记录，而内存中的游标没有前进，两者已经错位；即使 recover 后继续 `Set` 也会串位。因此不要把 `Set` 的 panic 当作可恢复错误——让它冒泡退出进程，或者丢弃这个 map 重新构建。
 - **`SplitSep`**：这是包级变量，`BytesToStruct` / `StructToStr` / `checkStr` 在运行期读取它。只允许在任何并发使用之前（一般是程序初始化阶段）设置，运行期并发修改会构成数据竞争。
 
@@ -141,15 +156,16 @@ unsafeStr, ok := m.GetValueUnsafe(1001) //零拷贝，引用内存数据
 
 ## 6. 测试
 
-`go test ./...` 共 69 个用例，覆盖：
+`go test ./...` 共 76 个用例，覆盖：
 
 - 双向索引类型：与官方双 map 逐条对比、双向互查、重复 id / 重复字符串 panic 且计数不变、空字符串、id 边界值、字符串 65535/65536 边界、`SetFinished` 前后状态机、探测冲突下的重复检测、并发双向只读、`Set` 与 `SetBytes` 结果等价、重复字符串 panic 消息的截断与 rune 边界；
+- `SetSafe`：成功路径与 `Set` 等价、四类失败分别能用 `errors.Is` 判定且不 panic、失败后 `Len` 不变并可继续写入、与 `Set` 混用时互相识别重复；
 
 - 四种类型与原 `map` 的逐键对比（各 1 万条），空键、空值、空 map、键类型边界值；
 - 重复键立即报错、`Len` 计数、`SetFinished` 幂等与失败后状态、`SetFinished` 后禁止写入；
 - 人为构造哈希冲突验证探测序列（读取、重复检测、不存在键返回 false）；
 - 值长度 65535/65536 边界、位置索引 uint32 上限；
-- 临时文件：默认落点不在工作目录、同名文件报错且不误删、切换工作目录后仍能加载；
+- 临时文件：默认落点不在工作目录、同名自动避让且不误删/不改动旧文件、切换工作目录后仍能加载；
 - 序列化：末尾分隔符、多字节/空分隔符、字段过多、非数字首段、缓存池边界长度、切片往返、损坏数据报错；
 - 10 万条键值完整性、8 协程并发只读、零拷贝转换；
 - 四类空值 `GetUnsafe` 的 nil 语义一致、`SetFinished` 前用位置取值报状态错误、`fileExist` 的"无法判断不算存在"、`JoinInterface` 输出与逐元素 `fmt.Sprint` 完全一致（含同时实现 `error` 与 `fmt.Stringer` 的类型、以及 `String()` 内部 panic 的类型）；

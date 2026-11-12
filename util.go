@@ -7,16 +7,22 @@ package noGcStaticMap
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"time"
 )
 
 const (
 	// tempFileSuffix 临时文件名后缀
 	tempFileSuffix = ".NoGcStaticMap"
+	// tempFileMaxRetry 同名冲突时最多尝试多少个带时间戳的新名字
+	tempFileMaxRetry = 64
 	// tempFileBufSize 临时文件的写缓存大小
 	tempFileBufSize = 40960
 	// maxKVLen 默认类型与整型map中值允许的最大长度
@@ -33,15 +39,46 @@ func createTempFile(args ...string) (tempFileName string, tempFile *os.File, bw 
 	if len(args) > 0 && args[0] != "" {
 		name, err := filepath.Abs(args[0] + tempFileSuffix)
 		haserrPanic(err)
-		tempFile, err = os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
-		if err != nil {
-			panic(fmt.Sprintf("can't create temp file %v, maybe an other map is using the same name, error:%v", name, err))
-		}
-		return name, tempFile, bufio.NewWriterSize(tempFile, tempFileBufSize)
+		tempFile, err = createTempFileNoClash(name)
+		haserrPanic(err)
+		return tempFile.Name(), tempFile, bufio.NewWriterSize(tempFile, tempFileBufSize)
 	}
 	tempFile, err := os.CreateTemp("", "noGcStaticMap-*"+tempFileSuffix)
 	haserrPanic(err)
 	return tempFile.Name(), tempFile, bufio.NewWriterSize(tempFile, tempFileBufSize)
+}
+
+// createTempFileNoClash 按给定名字独占创建临时文件。
+// 若同名文件已经存在（例如程序上次异常退出留下的、或其它实例正在使用的），
+// 不会删除对方，而是在基础名后追加"-"+纳秒时间戳继续尝试，
+// 直到拿到一个空闲名字为止；最终名字形如 no_gc_map_bi-1762912345123456789.NoGcStaticMap。
+func createTempFileNoClash(baseName string) (*os.File, error) {
+	f, err := openExclusive(baseName)
+	if err == nil {
+		return f, nil
+	}
+	if !errors.Is(err, fs.ErrExist) {
+		return nil, err
+	}
+	stem := strings.TrimSuffix(baseName, tempFileSuffix)
+	for i := 0; i < tempFileMaxRetry; i++ {
+		name := stem + "-" + strconv.FormatInt(time.Now().UnixNano(), 10) + tempFileSuffix
+		f, err = openExclusive(name)
+		if err == nil {
+			return f, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return nil, err
+		}
+		//同一纳秒内再次撞名：让出时间片后换一个新的时间戳重试
+		time.Sleep(time.Microsecond)
+	}
+	return nil, fmt.Errorf("can't create temp file for %v after %v attempts", baseName, tempFileMaxRetry)
+}
+
+// openExclusive 以"不存在才创建"的方式打开文件，同名时不覆盖也不删除
+func openExclusive(name string) (*os.File, error) {
+	return os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
 }
 
 // fileExist 判断文件或者目录是否确定存在。

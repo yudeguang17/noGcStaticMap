@@ -6,6 +6,7 @@
 package noGcStaticMap
 
 import (
+	"errors"
 	"strconv"
 	"strings"
 	"sync"
@@ -251,11 +252,31 @@ func TestBidirectConcurrentRead(t *testing.T) {
 // TestBidirectSameTempName 同名临时文件必须明确报错，且不能删掉对方的文件
 func TestBidirectSameTempName(t *testing.T) {
 	name := tempName(t)
-	m := NewBidirect(name)
-	defer m.SetFinished()
-	assertPanic(t, "can't create temp file", func() { NewBidirect(name) })
+	m1 := NewBidirect(name)
+	defer m1.SetFinished()
+	m2 := NewBidirect(name)
+	defer m2.SetFinished()
+	if m1.tempFileName == m2.tempFileName {
+		t.Fatalf("two maps share the same temp file: %v", m1.tempFileName)
+	}
 	if !fileExist(name + tempFileSuffix) {
-		t.Fatal("the temp file of the first map was deleted")
+		t.Fatal("the temp file of the first map was renamed or deleted")
+	}
+	m1.Set(1, "one")
+	m2.Set(2, "two")
+	m1.SetFinished()
+	m2.SetFinished()
+	if v, exist := m1.GetValue(1); !exist || v != "one" {
+		t.Fatalf("unexpected value of m1; got %q exist=%v", v, exist)
+	}
+	if _, exist := m1.GetValue(2); exist {
+		t.Fatal("m1 should not see m2's data")
+	}
+	if v, exist := m2.GetValue(2); !exist || v != "two" {
+		t.Fatalf("unexpected value of m2; got %q exist=%v", v, exist)
+	}
+	if _, exist := m2.GetValue(1); exist {
+		t.Fatal("m2 should not see m1's data")
 	}
 }
 
@@ -342,4 +363,151 @@ func TestBidirectDuplicateStrPanicMessageRuneSafe(t *testing.T) {
 		t.Fatalf("panic message should carry the total length; got %q", msg)
 	}
 	m.SetFinished()
+}
+
+// TestBidirectSetSafeSuccess SetSafe成功路径必须与Set完全等价
+func TestBidirectSetSafeSuccess(t *testing.T) {
+	bySet := NewBidirect(tempName(t))
+	bySafe := NewBidirect(tempName(t))
+	for i := 0; i < 200; i++ {
+		str := "value-" + strconv.Itoa(i)
+		bySet.Set(uint32(i), str)
+		if err := bySafe.SetSafe(uint32(i), str); err != nil {
+			t.Fatalf("unexpected error for id %v: %v", i, err)
+		}
+	}
+	if bySafe.Len() != bySet.Len() {
+		t.Fatalf("unexpected len; got %v want %v", bySafe.Len(), bySet.Len())
+	}
+	bySet.SetFinished()
+	bySafe.SetFinished()
+	for i := 0; i < 200; i++ {
+		want, _ := bySet.GetValue(uint32(i))
+		got, exist := bySafe.GetValue(uint32(i))
+		if !exist || got != want {
+			t.Fatalf("id %v: got %q exist=%v want %q", i, got, exist, want)
+		}
+		if id, exist := bySafe.GetID(want); !exist || id != uint32(i) {
+			t.Fatalf("str %q: got id=%v exist=%v want %v", want, id, exist, i)
+		}
+	}
+}
+
+// TestBidirectSetSafeDuplicateID 重复id返回ErrDuplicateID，且不改变计数与已有数据
+func TestBidirectSetSafeDuplicateID(t *testing.T) {
+	m := NewBidirect(tempName(t))
+	if err := m.SetSafe(1, "a"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	err := m.SetSafe(1, "b")
+	if !errors.Is(err, ErrDuplicateID) {
+		t.Fatalf("unexpected error; got %v want %v", err, ErrDuplicateID)
+	}
+	if !strings.Contains(err.Error(), "id=1") {
+		t.Fatalf("error message should carry the id; got %q", err.Error())
+	}
+	if m.Len() != 1 {
+		t.Fatalf("unexpected len after failed set; got %v want 1", m.Len())
+	}
+	//失败之后map仍可继续正常写入
+	if err := m.SetSafe(2, "b"); err != nil {
+		t.Fatalf("unexpected error after failed set: %v", err)
+	}
+	m.SetFinished()
+	if v, exist := m.GetValue(1); !exist || v != "a" {
+		t.Fatalf("unexpected value; got %q exist=%v", v, exist)
+	}
+	if v, exist := m.GetValue(2); !exist || v != "b" {
+		t.Fatalf("unexpected value; got %q exist=%v", v, exist)
+	}
+}
+
+// TestBidirectSetSafeDuplicateStr 重复字符串返回ErrDuplicateStr
+func TestBidirectSetSafeDuplicateStr(t *testing.T) {
+	m := NewBidirect(tempName(t))
+	if err := m.SetSafe(1, "same"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	err := m.SetSafe(2, "same")
+	if !errors.Is(err, ErrDuplicateStr) {
+		t.Fatalf("unexpected error; got %v want %v", err, ErrDuplicateStr)
+	}
+	if m.Len() != 1 {
+		t.Fatalf("unexpected len after failed set; got %v want 1", m.Len())
+	}
+	//被拒绝的id不能留下脏索引
+	if err := m.SetSafe(2, "other"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	m.SetFinished()
+	if id, exist := m.GetID("same"); !exist || id != 1 {
+		t.Fatalf("unexpected id; got %v exist=%v", id, exist)
+	}
+	if _, exist := m.GetValue(2); !exist {
+		t.Fatal("unexpected exist; got false want true")
+	}
+}
+
+// TestBidirectSetSafeStrTooLong 超长字符串返回ErrStrTooLong
+func TestBidirectSetSafeStrTooLong(t *testing.T) {
+	m := NewBidirect(tempName(t))
+	long := make([]byte, maxKVLen)
+	for i := range long {
+		long[i] = 'x'
+	}
+	if err := m.SetSafe(1, string(long)); err != nil {
+		t.Fatalf("unexpected error at the limit: %v", err)
+	}
+	err := m.SetSafe(2, string(long)+"x")
+	if !errors.Is(err, ErrStrTooLong) {
+		t.Fatalf("unexpected error; got %v want %v", err, ErrStrTooLong)
+	}
+	if m.Len() != 1 {
+		t.Fatalf("unexpected len; got %v want 1", m.Len())
+	}
+	m.SetFinished()
+}
+
+// TestBidirectSetSafeAfterFinished SetFinished之后返回ErrSetFinished而不是panic
+func TestBidirectSetSafeAfterFinished(t *testing.T) {
+	m := NewBidirect(tempName(t))
+	if err := m.SetSafe(1, "a"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	m.SetFinished()
+	err := m.SetSafe(2, "b")
+	if !errors.Is(err, ErrSetFinished) {
+		t.Fatalf("unexpected error; got %v want %v", err, ErrSetFinished)
+	}
+	if m.Len() != 1 {
+		t.Fatalf("unexpected len; got %v want 1", m.Len())
+	}
+	if v, exist := m.GetValue(1); !exist || v != "a" {
+		t.Fatalf("unexpected value; got %q exist=%v", v, exist)
+	}
+}
+
+// TestBidirectSetSafeMixWithSet Set与SetSafe必须写入同一份索引，互相能识别重复
+func TestBidirectSetSafeMixWithSet(t *testing.T) {
+	m := NewBidirect(tempName(t))
+	m.Set(1, "one") //Set走panic路径
+	if err := m.SetSafe(1, "one2"); !errors.Is(err, ErrDuplicateID) {
+		t.Fatalf("SetSafe should see the id inserted by Set; got %v", err)
+	}
+	if err := m.SetSafe(2, "one"); !errors.Is(err, ErrDuplicateStr) {
+		t.Fatalf("SetSafe should see the str inserted by Set; got %v", err)
+	}
+	if err := m.SetSafe(3, "three"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	//Set也必须能看到SetSafe写进去的键
+	assertPanic(t, "for twice", func() { m.Set(3, "four") })
+	assertPanic(t, "for twice", func() { m.Set(4, "three") })
+	m.SetFinished()
+	for _, kv := range [][2]string{{"1", "one"}, {"3", "three"}} {
+		id, _ := strconv.Atoi(kv[0])
+		if v, exist := m.GetValue(uint32(id)); !exist || v != kv[1] {
+			t.Fatalf("unexpected value for %v; got %q exist=%v", kv[0], v, exist)
+		}
+	}
 }

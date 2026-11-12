@@ -9,6 +9,8 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"os"
 	"runtime"
 	"strconv"
@@ -36,6 +38,21 @@ type NoGcStaticMapBidirect struct {
 	indexByStr map[uint64]uint32
 }
 
+// ErrSetFinished SetFinished之后再写入，可由SetSafe返回。
+var ErrSetFinished = errors.New("noGcStaticMap: can't Set after SetFinished")
+
+// ErrStrTooLong 字符串长度超过65535，可由SetSafe返回。
+var ErrStrTooLong = errors.New("noGcStaticMap: str is too long, the maximum is 65535")
+
+// ErrDataTooLarge 位置索引超出uint32的表示范围(单map数据区超过4GiB)，可由SetSafe返回。
+var ErrDataTooLarge = errors.New("noGcStaticMap: data size is too large, the offset exceeds uint32 limit")
+
+// ErrDuplicateID id已经存在，可由SetSafe返回。
+var ErrDuplicateID = errors.New("noGcStaticMap: duplicate id")
+
+// ErrDuplicateStr 字符串已经存在，可由SetSafe返回。
+var ErrDuplicateStr = errors.New("noGcStaticMap: duplicate str")
+
 // 初始化 双向索引类型，字符串的最大长度为65535
 func NewBidirect(tempFileName ...string) *NoGcStaticMapBidirect {
 	var n NoGcStaticMapBidirect
@@ -54,32 +71,69 @@ func (n *NoGcStaticMapBidirect) releaseTempFile() {
 	n.tempFileName = ""
 }
 
-// 增加数据：id与字符串任一重复都直接panic
+// 增加数据：id与字符串任一重复都直接panic。需要以error形式拿到失败原因时用SetSafe
 func (n *NoGcStaticMapBidirect) Set(id uint32, str string) {
 	//string是不可变的，这里零拷贝转成[]byte交给内部实现，省掉每条记录一次复制
-	n.set(id, UnsafeStringToBytes(str))
+	n.mustSet(id, UnsafeStringToBytes(str))
 }
 
 // 增加数据,以[]byte的方式：构建期用字节切片灌数据时不会额外复制一份字符串
 func (n *NoGcStaticMapBidirect) SetBytes(id uint32, str []byte) {
-	n.set(id, str)
+	n.mustSet(id, str)
 }
 
-// set 两个公开写入口的共同实现，全程只处理[]byte，不做字符串复制
-func (n *NoGcStaticMapBidirect) set(id uint32, str []byte) {
+// SetSafe 与Set语义相同，但任何失败都只返回error而不panic，
+// 便于"读一批数据、跳过重复项继续处理"这类不能中断的场景：
+// 重复id返回ErrDuplicateID，重复字符串返回ErrDuplicateStr，
+// 字符串超过65535返回ErrStrTooLong，SetFinished之后再写入返回ErrSetFinished，
+// 位置索引超过4GiB上限返回ErrDataTooLarge。
+func (n *NoGcStaticMapBidirect) SetSafe(id uint32, str string) error {
+	return n.set(id, UnsafeStringToBytes(str))
+}
+
+// mustSet 供Set/SetBytes使用：把内部实现返回的error还原成原来的panic消息
+func (n *NoGcStaticMapBidirect) mustSet(id uint32, str []byte) {
+	if err := n.set(id, str); err != nil {
+		panic(n.setPanicMessage(err, id, str))
+	}
+}
+
+// setPanicMessage 保持Set/SetBytes原有的panic文案不变
+func (n *NoGcStaticMapBidirect) setPanicMessage(err error, id uint32, str []byte) string {
+	switch {
+	case errors.Is(err, ErrSetFinished):
+		return "can't Set after SetFinished"
+	case errors.Is(err, ErrStrTooLong):
+		return "str is too long,The maximum is 65535"
+	case errors.Is(err, ErrDataTooLarge):
+		return fmt.Sprintf("data size is too large, the offset must be <= %v bytes(uint32 limit), current offset is %v", uint64(maxOffset), n.dataBeginPos)
+	case errors.Is(err, ErrDuplicateID):
+		return "can't add the id '" + strconv.FormatUint(uint64(id), 10) + "' for twice"
+	case errors.Is(err, ErrDuplicateStr):
+		return "can't add the str '" + abbreviateForPanic(str) + "' for twice"
+	}
+	return err.Error()
+}
+
+// set 三个公开写入口的共同实现，全程只处理[]byte，不做字符串复制；
+// 校验与冲突检测都发生在任何写入之前，失败时数据区与索引均保持原样。
+func (n *NoGcStaticMapBidirect) set(id uint32, str []byte) error {
 	//键值设置完之后，不允许再添加
 	if n.setFinished {
-		panic("can't Set after SetFinished")
+		return ErrSetFinished
 	}
 	//判断字符串长度，不允许太长
 	if len(str) > maxKVLen {
-		panic("str is too long,The maximum is 65535")
+		return ErrStrTooLong
 	}
 	//位置索引是uint32，这里先校验不会溢出
-	pos := checkDataPos(n.dataBeginPos)
+	if n.dataBeginPos < 0 || int64(n.dataBeginPos) > maxOffset {
+		return fmt.Errorf("%w: current offset is %d", ErrDataTooLarge, n.dataBeginPos)
+	}
+	pos := uint32(n.dataBeginPos)
 	//id即索引，重复立即报错
 	if _, exist := n.indexByID[id]; exist {
-		panic("can't add the id '" + strconv.FormatUint(uint64(id), 10) + "' for twice")
+		return fmt.Errorf("%w: id=%d", ErrDuplicateID, id)
 	}
 	//在字符串索引中寻找第一个空闲槽位，同时完成重复字符串检测
 	h := hashKey(str)
@@ -90,7 +144,7 @@ func (n *NoGcStaticMapBidirect) set(id uint32, str []byte) {
 			break
 		}
 		if n.sameStrAtTempFile(int(dataBeginPos), str) {
-			panic("can't add the str '" + abbreviateForPanic(str) + "' for twice")
+			return fmt.Errorf("%w: str=%q", ErrDuplicateStr, abbreviateForPanic(str))
 		}
 		h = nextProbeHash(h)
 	}
@@ -99,6 +153,7 @@ func (n *NoGcStaticMapBidirect) set(id uint32, str []byte) {
 	n.indexByStr[h] = pos
 	n.indexByID[id] = pos
 	n.len = n.len + 1
+	return nil
 }
 
 // abbreviateForPanic 把可能的超长字符串截断成适合放进panic消息的形式：

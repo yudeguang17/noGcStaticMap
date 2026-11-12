@@ -90,9 +90,61 @@ func TestSameTempName(t *testing.T) {
 	name := tempName(t)
 	m1 := NewInt(name)
 	defer m1.SetFinished()
-	assertPanic(t, "can't create temp file", func() { NewInt(name) })
+	//同名不再报错：第二个实例会拿到一个带时间戳的名字
+	m2 := NewInt(name)
+	defer m2.SetFinished()
+	if m1.tempFileName == m2.tempFileName {
+		t.Fatalf("two maps share the same temp file: %v", m1.tempFileName)
+	}
+	if !strings.HasPrefix(filepath.Base(m2.tempFileName), filepath.Base(name)+"-") ||
+		!strings.HasSuffix(m2.tempFileName, tempFileSuffix) {
+		t.Fatalf("unexpected bumped temp file name: %v", m2.tempFileName)
+	}
 	if !fileExist(name + tempFileSuffix) {
-		t.Fatal("the temp file of the first map was deleted")
+		t.Fatal("the temp file of the first map was renamed or deleted")
+	}
+	//两个实例的数据必须互不干扰
+	m1.SetString(1, "from-m1")
+	m2.SetString(1, "from-m2")
+	m1.SetFinished()
+	m2.SetFinished()
+	if v, exist := m1.GetString(1); !exist || v != "from-m1" {
+		t.Fatalf("unexpected value of m1; got %q exist=%v", v, exist)
+	}
+	if v, exist := m2.GetString(1); !exist || v != "from-m2" {
+		t.Fatalf("unexpected value of m2; got %q exist=%v", v, exist)
+	}
+}
+
+// TestTempFilePreExistingAutoRename 生成指定文件名时若磁盘上已有同名文件（如上次异常退出遗留），
+// 不能启动即挂，也不能删改那个旧文件，而是换一个带时间戳的名字
+func TestTempFilePreExistingAutoRename(t *testing.T) {
+	name := tempName(t)
+	oldName := name + tempFileSuffix
+	const oldContent = "left over by previous run"
+	if err := os.WriteFile(oldName, []byte(oldContent), 0600); err != nil {
+		t.Fatal(err)
+	}
+	m := NewInt(name)
+	defer m.SetFinished()
+	if m.tempFileName == oldName {
+		t.Fatalf("the pre-existing file was reused: %v", m.tempFileName)
+	}
+	//旧文件的内容不能被改动
+	if b, err := os.ReadFile(oldName); err != nil || string(b) != oldContent {
+		t.Fatalf("the pre-existing file was modified; content=%q err=%v", string(b), err)
+	}
+	m.SetString(1, "v1")
+	m.SetFinished()
+	if v, exist := m.GetString(1); !exist || v != "v1" {
+		t.Fatalf("unexpected value; got %q exist=%v", v, exist)
+	}
+	//新文件用完即删，旧文件仍在
+	if fileExist(m.tempFileName) {
+		t.Fatalf("the bumped temp file should be removed after SetFinished: %v", m.tempFileName)
+	}
+	if !fileExist(oldName) {
+		t.Fatal("the pre-existing file should be kept untouched")
 	}
 }
 
