@@ -9,52 +9,59 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
-	"github.com/cespare/xxhash"
-	"io/ioutil"
 	"os"
+	"runtime"
 )
 
 // 其它类型，值最长为65535，此类型无此限制
 type NoGcStaticMapHuge struct {
-	setFinished         bool //是否完成存储
-	dataBeginPos        int  //游标，记录位置
-	len                 int  //记录键值对个数
-	bw                  *bufio.Writer
-	tempFile            *os.File          //硬盘上的临时文件
-	tempFileName        string            //临时文件名
-	data                []byte            //存储键值的内容
-	index               map[uint64]uint32 //值为切片data []byte中的某个位置,此索引存储无hash冲突的key的hash值以及有hash冲突但是是第1次出现的key的hash值
-	mapForHashCollision map[string]uint32 //值为切片data []byte中的某个位置,string为存放有hash冲突的第2次或2次以上出现的key,这个map一般来说是非常小的
+	setFinished  bool //是否完成存储
+	dataBeginPos int  //游标，记录位置
+	len          int  //记录键值对个数
+	bw           *bufio.Writer
+	tempFile     *os.File
+	tempFileName string
+	data         []byte
+	// index 是唯一的一张索引表：键的哈希值(探测序列当前槽位) -> 该键值对在data中的开始位置。
+	// 与原实现相比不再需要第二张存放哈希冲突键的map：静态map没有删除操作，
+	// 已占用的槽位永远保持占用，因此"键派生探测序列"足以在同一张表内解决冲突。
+	index map[uint64]uint32
 }
 
 // 初始化 对键值的长度不做限制，除非是存储值的长度超长的情况，否则不建议使用此类型，因为会占用更多的空间
 func NewHuge(tempFileName ...string) *NoGcStaticMapHuge {
 	var n NoGcStaticMapHuge
-	n.mapForHashCollision = make(map[string]uint32)
 	n.index = make(map[uint64]uint32)
 	n.tempFileName, n.tempFile, n.bw = createTempFile(tempFileName...)
+	//兜底：未调用SetFinished就被丢弃时，关闭并删除临时文件
+	runtime.SetFinalizer(&n, (*NoGcStaticMapHuge).releaseTempFile)
 	return &n
+}
+
+// releaseTempFile 关闭并删除尚未完成的临时文件，由GC终结器调用
+func (n *NoGcStaticMapHuge) releaseTempFile() {
+	cleanupTempFile(n.tempFile, n.tempFileName)
+	n.tempFile = nil
+	n.tempFileName = ""
 }
 
 // 取出数据
 func (n *NoGcStaticMapHuge) Get(k []byte) (v []byte, exist bool) {
-	if !n.setFinished {
-		panic("cant't Get before SetFinished")
-	}
-	h := xxhash.Sum64(k)
-	dataBeginPos, exist := n.index[h]
-	if exist {
+	n.checkSetFinished()
+	h := hashKey(k)
+	for {
+		dataBeginPos, ok := n.index[h]
+		if !ok {
+			//空槽位：静态map无删除，该键必然不存在
+			return nil, false
+		}
 		v, exist = n.read(k, int(dataBeginPos))
 		if exist {
-			return
+			return v, true
 		}
+		//该槽位被其它键占用，沿同一个键派生出的探测序列继续找
+		h = nextProbeHash(h)
 	}
-	//上面没找到，再从可能存在hash冲突的小表查找
-	dataBeginPos, exist = n.mapForHashCollision[string(k)]
-	if exist {
-		return n.read(k, int(dataBeginPos))
-	}
-	return v, false
 }
 
 // 取出数据 警告:返回的数据是hash表中值的引用，而非值的复制品，要注意不要在外部改变该返回值
@@ -87,26 +94,18 @@ func (n *NoGcStaticMapHuge) GetStringUnsafe(k string) (v string, exist bool) {
 
 // 取出键值对在数据中存储的开始位置
 func (n *NoGcStaticMapHuge) GetDataBeginPosOfKVPair(k []byte) (uint32, bool) {
-	if !n.setFinished {
-		panic("cant't Get before SetFinished")
-	}
-	h := xxhash.Sum64(k)
-	dataBeginPos, exist := n.index[h]
-	if exist {
-		_, exist = n.read(k, int(dataBeginPos))
-		if exist {
+	n.checkSetFinished()
+	h := hashKey(k)
+	for {
+		dataBeginPos, ok := n.index[h]
+		if !ok {
+			return 0, false
+		}
+		if n.sameKeyAtData(int(dataBeginPos), k) {
 			return dataBeginPos, true
 		}
+		h = nextProbeHash(h)
 	}
-	//上面没找到，再从可能存在hash冲突的小表查找
-	dataBeginPos, exist = n.mapForHashCollision[string(k)]
-	if exist {
-		_, exist = n.read(k, int(dataBeginPos))
-		if exist {
-			return dataBeginPos, true
-		}
-	}
-	return 0, false
 }
 
 // 从内存中的某个位置取出键值对中值的数据
@@ -114,36 +113,48 @@ func (n *NoGcStaticMapHuge) GetDataBeginPosOfKVPair(k []byte) (uint32, bool) {
 // 1)传入的dataBeginPos必须是真实有效的，否则有可能会数据越界;
 // 2)返回的数据是hash表中值的引用，而非值的复制品，要注意不要在外部改变该返回值
 func (n *NoGcStaticMapHuge) GetValFromDataBeginPosOfKVPairUnSafe(dataBeginPos int) (v []byte) {
+	n.checkSetFinished()
 	keyLen := binary.LittleEndian.Uint32(n.data[dataBeginPos : dataBeginPos+4])
 	dataBeginPos = dataBeginPos + 4
 	valLen := binary.LittleEndian.Uint32(n.data[dataBeginPos : dataBeginPos+4])
 	dataBeginPos = dataBeginPos + 4
-	//读取键的内容，并判断键是否相同
+	//跳过键的内容
 	dataBeginPos = dataBeginPos + int(keyLen)
+	//空值统一返回nil，与Int/Uint32以及Get/GetString的语义保持一致
+	if valLen == 0 {
+		return nil
+	}
 	return n.data[dataBeginPos : dataBeginPos+int(valLen)]
 }
 
 // 增加数据
 func (n *NoGcStaticMapHuge) Set(k, v []byte) {
-	n.len = n.len + 1
 	//键值设置完之后，不允许再添加
 	if n.setFinished {
 		panic("can't Set after SetFinished")
 	}
-	h := xxhash.Sum64(k)
-	//处理hash碰撞问题
-	_, exist := n.index[h]
-	if exist {
-		//尽可能的避免重复加载,如果在mapNoHashCollision加载过，确实也是无法检测的，但是如果加载了3次一定会被检测到
-		if _, exist := n.mapForHashCollision[string(k)]; exist {
+	//本类型不限制键值长度，但长度字段与位置索引都是uint32，先校验不会溢出
+	checkBytesLen(len(k), "k")
+	checkBytesLen(len(v), "v")
+	pos := checkDataPos(n.dataBeginPos)
+	//在唯一的一张索引表中寻找本键对应的槽位，同时完成重复写入检测
+	h := hashKey(k)
+	for {
+		dataBeginPos, exist := n.index[h]
+		if !exist {
+			//h即第一个空闲槽位，写完数据后再占用它
+			break
+		}
+		if n.sameKeyAtTempFile(int(dataBeginPos), k) {
+			//同一个键写入两次，直接报错，而不是悄悄丢掉后一次写入
 			panic("can't add the key '" + string(k) + "' for twice")
 		}
-		n.mapForHashCollision[string(k)] = uint32(n.dataBeginPos)
-	} else {
-		n.index[h] = uint32(n.dataBeginPos)
+		h = nextProbeHash(h)
 	}
-	//存储数据到临时文件，并且移动游标
 	n.write(k, v)
+	n.index[h] = pos
+	//校验与写入都成功之后才计数，避免panic被recover后Len()虚高
+	n.len = n.len + 1
 }
 
 // 增加数据,以string的方式
@@ -151,70 +162,110 @@ func (n *NoGcStaticMapHuge) SetString(k, v string) {
 	n.Set([]byte(k), []byte(v))
 }
 
-// 从内存中读取相应数据 注意 K,V长度各自占4个字节
+// 完成键值存储,之后只允许查询。该函数可以重复调用，重复调用不会再做任何事
+func (n *NoGcStaticMapHuge) SetFinished() {
+	if n.setFinished {
+		return
+	}
+	haserrPanic(n.bw.Flush())
+	if n.tempFile != nil {
+		haserrPanic(n.tempFile.Close())
+		n.tempFile = nil
+	}
+	b, err := os.ReadFile(n.tempFileName)
+	haserrPanic(err)
+	haserrPanic(os.Remove(n.tempFileName))
+	//直接接管读出来的切片，不再复制一份，避免大map在加载瞬间占用双倍内存
+	n.data = b
+	n.tempFileName = ""
+	n.setFinished = true
+}
+
+// 键值对个数
+func (n *NoGcStaticMapHuge) Len() int {
+	return n.len
+}
+
+// checkSetFinished 查询前的状态校验
+func (n *NoGcStaticMapHuge) checkSetFinished() {
+	if !n.setFinished {
+		panic("can't Get before SetFinished")
+	}
+}
+
+// sameKeyAtData 判断内存中某个位置上的键是否就是k。
+// 与read的区别是它只比较键，不会为命中项复制一份完整value——
+// GetDataBeginPosOfKVPair / GetUnsafe 这类"只要位置、不要值"的路径因此不再有多余的复制。
+func (n *NoGcStaticMapHuge) sameKeyAtData(dataBeginPos int, k []byte) bool {
+	keyLen := int(binary.LittleEndian.Uint32(n.data[dataBeginPos : dataBeginPos+4]))
+	if keyLen != len(k) {
+		return false
+	}
+	keyBegin := dataBeginPos + 8
+	return bytes.Equal(n.data[keyBegin:keyBegin+keyLen], k)
+}
+
+// sameKeyAtTempFile 判断临时文件中某个位置上的键是否就是k，仅用于写入阶段的冲突探测。
+// 先只读8字节长度前缀：长度不同即可断定不是同一个键，不必读出整份键内容，
+// 也就不会为每一次冲突探测都分配一份键的副本（本类型的键长度没有65535的上限）。
+func (n *NoGcStaticMapHuge) sameKeyAtTempFile(dataBeginPos int, k []byte) bool {
+	var kvLenBuf [8]byte
+	n.readTempFile(kvLenBuf[:], dataBeginPos)
+	keyLen := int(binary.LittleEndian.Uint32(kvLenBuf[0:4]))
+	if keyLen != len(k) {
+		return false
+	}
+	if keyLen == 0 {
+		return true
+	}
+	key := make([]byte, keyLen)
+	n.readTempFile(key, dataBeginPos+8)
+	return bytes.Equal(key, k)
+}
+
+// readTempFile 从临时文件读取一段数据；只有目标字节还在写缓存里时才需要先刷盘
+func (n *NoGcStaticMapHuge) readTempFile(b []byte, dataBeginPos int) {
+	if need := dataBeginPos + len(b); need > n.dataBeginPos-n.bw.Buffered() {
+		haserrPanic(n.bw.Flush())
+	}
+	_, err := n.tempFile.ReadAt(b, int64(dataBeginPos))
+	haserrPanic(err)
+}
+
+// 往文件中写入数据
+func (n *NoGcStaticMapHuge) write(k, v []byte) {
+	var kvLenBuf [8]byte //4个字节表示K的长度，4个字节表示V的长度
+	binary.LittleEndian.PutUint32(kvLenBuf[0:4], uint32(len(k)))
+	binary.LittleEndian.PutUint32(kvLenBuf[4:8], uint32(len(v)))
+	_, err := n.bw.Write(kvLenBuf[:])
+	haserrPanic(err)
+	if len(k) > 0 {
+		_, err = n.bw.Write(k)
+		haserrPanic(err)
+	}
+	if len(v) > 0 {
+		_, err = n.bw.Write(v)
+		haserrPanic(err)
+	}
+	//写完了，移动游标
+	n.dataBeginPos = n.dataBeginPos + 8 + len(k) + len(v)
+}
+
+// 从内存中读取相应数据
 func (n *NoGcStaticMapHuge) read(k []byte, dataBeginPos int) (v []byte, exist bool) {
-	//读取键值的长度
 	keyLen := binary.LittleEndian.Uint32(n.data[dataBeginPos : dataBeginPos+4])
 	dataBeginPos = dataBeginPos + 4
 	valLen := binary.LittleEndian.Uint32(n.data[dataBeginPos : dataBeginPos+4])
 	dataBeginPos = dataBeginPos + 4
 	//读取键的内容，并判断键是否相同
-	if !bytes.Equal(k, n.data[dataBeginPos:dataBeginPos+int(keyLen)]) {
-		return v, false
+	if !bytes.Equal(n.data[dataBeginPos:dataBeginPos+int(keyLen)], k) {
+		return nil, false
 	}
-	//读取值并返回
+	dataBeginPos = dataBeginPos + int(keyLen)
 	if valLen == 0 {
 		return nil, true
 	}
-	dataBeginPos = dataBeginPos + int(keyLen)
-	v = make([]byte, 0, int(valLen))
-	v = append(v, n.data[dataBeginPos:dataBeginPos+int(valLen)]...)
+	v = make([]byte, valLen)
+	copy(v, n.data[dataBeginPos:dataBeginPos+int(valLen)])
 	return v, true
-}
-
-// 往文件中写入数据 注意 K,V长度各自占4个字节
-func (n *NoGcStaticMapHuge) write(k, v []byte) {
-	dataLen := 8 + len(k) + len(v) //K,V各自占4个字节
-	kbuf := uint32ToByte(uint32(len(k)))
-	vbuf := uint32ToByte(uint32(len(v)))
-	//写入K的长度
-	_, err := n.bw.Write(kbuf[:])
-	haserrPanic(err)
-	//写入v的长度
-	_, err = n.bw.Write(vbuf[:])
-	haserrPanic(err)
-	//写入k
-	for i := range k {
-		err = n.bw.WriteByte(k[i])
-		haserrPanic(err)
-	}
-	//写入V
-	for i := range v {
-		err = n.bw.WriteByte(v[i])
-		haserrPanic(err)
-	}
-	//写完了，移动游标
-	n.dataBeginPos = n.dataBeginPos + dataLen
-}
-
-// 完成存储把存储到硬盘上的文件复制到内存
-func (n *NoGcStaticMapHuge) SetFinished() {
-	n.setFinished = true
-	err := n.bw.Flush()
-	haserrPanic(err)
-	if n.tempFile != nil {
-		err = n.tempFile.Close()
-		haserrPanic(err)
-	}
-	b, err := ioutil.ReadFile(n.tempFileName)
-	haserrPanic(err)
-	n.data = make([]byte, 0, len(b))
-	n.data = append(n.data, b...)
-	err = os.Remove(n.tempFileName)
-	haserrPanic(err)
-}
-
-// 返回键值对个数
-func (n *NoGcStaticMapHuge) Len() int {
-	return n.len
 }
